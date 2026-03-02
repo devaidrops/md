@@ -56,24 +56,97 @@ cp /srv/coinexplorers.com/server/config/server.js \
 
 ---
 
-## 2. Выпуск SSL‑сертификатов для coinexplorers.com
+## 2. Проверка DNS
 
-Если сертификаты Let's Encrypt для `coinexplorers.com` ещё не выпущены, выполните:
+Перед настройкой nginx убедитесь, что домен уже указывает на этот сервер (иначе выпуск сертификата и проверки не сработают):
 
-**2.1. Остановить nginx (если нужен standalone/temporay webroot вариант)**
+```bash
+dig +short coinexplorers.com
+dig +short www.coinexplorers.com
+```
 
-Обычно достаточно webroot, так как в конфиге уже есть location для `/.well-known/acme-challenge/`. Ниже пример для нового домена с тем же webroot.
+IP должен совпадать с вашим сервером.
 
-**2.2. Выдать сертификат через certbot (webroot)**
+---
+
+## 3. Настройка nginx для coinexplorers.com (сначала только HTTP)
+
+Сертификат Let's Encrypt выдаётся только после того, как по домену на порту 80 доступен путь `/.well-known/acme-challenge/`. Поэтому **сначала** создаём конфиг для продакшен-домена и поднимаем только HTTP-блок (без SSL), затем получаем сертификат и уже потом включаем полный конфиг с HTTPS.
+
+**Что должно попасть в прод-конфиг без потерь** (полная копия тестового, только замена домена):
+
+- Три блока `server`: (1) HTTP → HTTPS, (2) HTTPS www → non-www, (3) основной HTTPS с локациями.
+- В основном HTTPS-блоке все локации как в тесте:
+  - `location ^~ /.well-known/acme-challenge/`
+  - `location = /sitemap.xml` → редирект на `/api/sitemap.xml`
+  - `location = /news` (с условием по `ref=university.mitosis.org`, **auth_basic**, proxy на 3000)
+  - `location /` (**auth_basic**, proxy на 3000)
+  - `location ^~ /strapi/` (proxy на 1337, все заголовки и таймауты)
+  - `location = /api/sitemap.xml` (proxy на 3000)
+  - `location ^~ /api/` (proxy на 8000, таймауты)
+- Общие настройки: `client_max_body_size 65M`, `include /etc/letsencrypt/options-ssl-nginx.conf`, `ssl_dhparam`, те же `proxy_set_header` и таймауты.
+
+### 3.1. Каталог для ACME-challenge (webroot)
+
+```bash
+sudo mkdir -p /var/www/_acme-challenge/coinexplorers.com
+sudo chown -R www-data:www-data /var/www/_acme-challenge/coinexplorers.com
+```
+
+### 3.2. Временный конфиг: только HTTP (порт 80) для coinexplorers.com
+
+Он нужен только чтобы certbot мог пройти проверку. Создайте файл:
+
+```bash
+sudo nano /etc/nginx/sites-available/coinexplorers.com-http-only.conf
+```
+
+Вставьте **только** один блок `server` (копия первого блока из тестового конфига, с заменой домена и webroot):
+
+```nginx
+# Временный HTTP-блок только для выпуска SSL (после получения сертификата заменим полным конфигом)
+server {
+    listen 80;
+    listen [::]:80;
+    server_name coinexplorers.com www.coinexplorers.com;
+
+    location ^~ /.well-known/acme-challenge/ {
+        default_type "text/plain";
+        root /var/www/_acme-challenge/coinexplorers.com;
+        allow all;
+    }
+
+    location / {
+        return 301 https://coinexplorers.com$request_uri;
+    }
+}
+```
+
+Включите только этот конфиг (полный с SSL пока не подключаем — сертификатов ещё нет):
+
+```bash
+sudo ln -sf /etc/nginx/sites-available/coinexplorers.com-http-only.conf \
+            /etc/nginx/sites-enabled/coinexplorers.com.conf
+```
+
+Проверка и перезагрузка nginx:
+
+```bash
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+---
+
+## 4. Выпуск SSL‑сертификатов для coinexplorers.com
+
+После того как nginx слушает порт 80 по домену `coinexplorers.com` и отдаёт `/.well-known/acme-challenge/`:
 
 ```bash
 sudo certbot certonly --webroot \
-  -w /var/www/_acme-challenge/coinexplorers.tw1.su \
+  -w /var/www/_acme-challenge/coinexplorers.com \
   -d coinexplorers.com \
   -d www.coinexplorers.com
 ```
-
-> Если webroot для нового домена будет другим, укажите корректный путь.
 
 Проверьте, что сертификаты появились:
 
@@ -85,74 +158,42 @@ sudo ls -la /etc/letsencrypt/live/coinexplorers.com
 
 ---
 
-## 3. Настройка nginx для coinexplorers.com
+## 5. Полный конфиг nginx для coinexplorers.com (без потерь настроек)
 
-Сейчас есть рабочий конфиг `/etc/nginx/sites-available/coinexplorers.tw1.su.conf`, который:
+Теперь подставляем **полную** копию тестового конфига с заменой только домена и путей к сертификату/webroot. Все локации, auth_basic, таймауты и заголовки сохраняются.
 
-- перенаправляет HTTP → HTTPS;
-- принудительно убирает `www`;
-- проксирует:
-  - `/` и `/news` → фронтенд `127.0.0.1:3000` (c basic auth);
-  - `/strapi/` → Strapi `127.0.0.1:1337`;
-  - `/api/` → API `127.0.0.1:8000`.
-
-Сделаем новый конфиг для `coinexplorers.com`, максимально повторяя логику.
-
-**3.1. Создать конфиг coinexplorers.com на основе tw1.su**
+**5.1. Создать полный конфиг из тестового (одна замена по домену)**
 
 ```bash
-sudo cp /etc/nginx/sites-available/coinexplorers.tw1.su.conf \
-        /etc/nginx/sites-available/coinexplorers.com.conf
+sudo sed 's/coinexplorers\.tw1\.su/coinexplorers.com/g' \
+  /etc/nginx/sites-available/coinexplorers.tw1.su.conf \
+  | sudo tee /etc/nginx/sites-available/coinexplorers.com-full.conf > /dev/null
 ```
 
-**3.2. Отредактировать новый конфиг**
+Так в прод попадёт весь конфиг тестового домена: все три `server`, все `location`, auth_basic, proxy на 3000/1337/8000, таймауты, `client_max_body_size` и т.д.
 
-Откройте файл:
-
-```bash
-sudo nano /etc/nginx/sites-available/coinexplorers.com.conf
-```
-
-Замените в нём все вхождения `coinexplorers.tw1.su` на `coinexplorers.com`:
-
-- `server_name coinexplorers.com www.coinexplorers.com;`
-- `return 301 https://coinexplorers.com$request_uri;`
-- `ssl_certificate     /etc/letsencrypt/live/coinexplorers.com/fullchain.pem;`
-- `ssl_certificate_key /etc/letsencrypt/live/coinexplorers.com/privkey.pem;`
-- `root /var/www/_acme-challenge/coinexplorers.com;` (если решите сделать отдельный webroot; можно оставить старый, но лучше разнести по доменам).
-
-Примерно структура файла должна остаться такой же, как в `coinexplorers.tw1.su.conf`:
-
-- первый `server {}` — HTTP → HTTPS redirect;
-- второй `server {}` — HTTPS `www` → non‑`www`;
-- третий `server {}` — основной HTTPS‑виртуалхост с proxy на 3000/1337/8000.
-
-**3.3. Включить сайт и проверить конфиг**
-
-Создать symlink в `sites-enabled` (если используется схема enabled/available):
+**5.2. Включить полный конфиг вместо временного**
 
 ```bash
-sudo ln -s /etc/nginx/sites-available/coinexplorers.com.conf \
+sudo rm -f /etc/nginx/sites-enabled/coinexplorers.com.conf
+sudo ln -s /etc/nginx/sites-available/coinexplorers.com-full.conf \
            /etc/nginx/sites-enabled/coinexplorers.com.conf
 ```
 
-Проверить конфигурацию nginx:
+**5.3. Проверить и перезагрузить nginx**
 
 ```bash
 sudo nginx -t
-```
-
-Если ошибок нет — перезагрузить nginx:
-
-```bash
 sudo systemctl reload nginx
 ```
 
-После этого nginx должен обслуживать **оба** домена: `coinexplorers.tw1.su` и `coinexplorers.com`.
+После этого продакшен-домен обслуживается по HTTP и HTTPS с теми же настройками, что и тестовый (включая basic auth, редиректы и прокси).
+
+> Временный файл `coinexplorers.com-http-only.conf` можно оставить (для истории) или удалить — продление сертификата certbot будет использовать уже полный конфиг, в котором есть `location ^~ /.well-known/acme-challenge/`.
 
 ---
 
-## 4. Обновление фронтенд `.env` под coinexplorers.com
+## 6. Обновление фронтенд `.env` под coinexplorers.com
 
 Текущий файл `/srv/coinexplorers.com/client/.env` содержит:
 
@@ -161,7 +202,7 @@ sudo systemctl reload nginx
 - `NEXT_PUBLIC_APP_HOST=https://coinexplorers.tw1.su`
 - `NEXT_PUBLIC_STRAPI_URL=https://coinexplorers.tw1.su`
 
-**4.1. Открыть и отредактировать `.env`**
+**6.1. Открыть и отредактировать `.env`**
 
 ```bash
 cd /srv/coinexplorers.com/client
@@ -183,7 +224,7 @@ NEXT_PUBLIC_REVIEWS_PRIORITY=0.8
 
 ---
 
-## 5. Обновление Strapi-конфига `server.js`
+## 7. Обновление Strapi-конфига `server.js`
 
 Файл: `/srv/coinexplorers.com/server/config/server.js`
 
@@ -193,7 +234,7 @@ NEXT_PUBLIC_REVIEWS_PRIORITY=0.8
 url: env("PUBLIC_URL", "https://coinexplorers.tw1.su"),
 ```
 
-**5.1. Отредактировать конфиг**
+**7.1. Отредактировать конфиг**
 
 ```bash
 cd /srv/coinexplorers.com/server
@@ -210,7 +251,7 @@ url: env("PUBLIC_URL", "https://coinexplorers.com"),
 
 ---
 
-## 6. Обновление `ecosystem.config.js` (pm2)
+## 8. Обновление `ecosystem.config.js` (pm2)
 
 Файл: `/srv/coinexplorers.com/ecosystem.config.js`
 
@@ -225,7 +266,7 @@ env: {
 }
 ```
 
-**6.1. Отредактировать PUBLIC_CLIENT_URL**
+**8.1. Отредактировать PUBLIC_CLIENT_URL**
 
 ```bash
 cd /srv/coinexplorers.com
@@ -242,18 +283,18 @@ PUBLIC_CLIENT_URL: "https://coinexplorers.com"
 
 ---
 
-## 7. Перезапуск процессов pm2 с новыми настройками
+## 9. Перезапуск процессов pm2 с новыми настройками
 
 После правок `.env`, `server.js` и `ecosystem.config.js` нужно перезапустить процессы под управлением `pm2`.
 
-**7.1. Загрузить обновлённый конфиг в pm2**
+**9.1. Загрузить обновлённый конфиг в pm2**
 
 ```bash
 cd /srv/coinexplorers.com
 pm2 startOrReload ecosystem.config.js
 ```
 
-**7.2. Проверить статус процессов**
+**9.2. Проверить статус процессов**
 
 ```bash
 pm2 status
@@ -264,9 +305,9 @@ pm2 logs --lines 50
 
 ---
 
-## 8. Проверка работы сайта по новому домену
+## 10. Проверка работы сайта по новому домену
 
-**8.1. Локальная проверка c сервера**
+**10.1. Локальная проверка c сервера**
 
 ```bash
 curl -I https://coinexplorers.com
@@ -276,7 +317,7 @@ curl -I https://coinexplorers.com/strapi
 
 Должны приходить коды `200`/`301` (в зависимости от маршрута), без 4xx/5xx.
 
-**8.2. Проверка из браузера**
+**10.2. Проверка из браузера**
 
 Откройте в браузере:
 
@@ -286,7 +327,7 @@ curl -I https://coinexplorers.com/strapi
 
 ---
 
-## 9. Плавное отключение тестового домена (опционально)
+## 11. Плавное отключение тестового домена (опционально)
 
 После того как убедились, что `coinexplorers.com` работает стабильно и DNS полностью перенесён:
 
@@ -331,7 +372,7 @@ sudo systemctl reload nginx
 
 ---
 
-## 10. Чек-лист перед завершением работ
+## 12. Чек-лист перед завершением работ
 
 - **DNS**: A/AAAA‑записи доменов `coinexplorers.com` и `www.coinexplorers.com` указывают на этот сервер;
 - **Сертификаты**: в `/etc/letsencrypt/live/coinexplorers.com` есть актуальные `fullchain.pem` и `privkey.pem`;
